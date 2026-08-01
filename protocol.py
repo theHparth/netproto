@@ -23,6 +23,8 @@ All multi-byte integers are BIG-ENDIAN (network byte order).
 """
 
 import struct
+import zlib
+from dataclasses import dataclass
 from enum import IntEnum
 
 # --------------------------------------------------------------------------
@@ -47,6 +49,11 @@ VERSION = 1
 #   I  = unsigned int, 4 B   -> length
 #   I  = unsigned int, 4 B   -> crc32
 HEADER_FORMAT = "!4sBBIII"
+
+# The same header WITHOUT the trailing crc32 field. This is the exact run of
+# bytes the CRC is computed over (together with the payload), so having it as
+# its own format string means we never slice by hand.
+HEADER_PREFIX_FORMAT = "!4sBBII"
 
 # 18. Computed, never hard-coded, so the two can't drift apart.
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
@@ -105,3 +112,108 @@ class TruncatedFrameError(ProtocolError):
 
 class PayloadTooLargeError(ProtocolError):
     """Declared length exceeds MAX_PAYLOAD_SIZE — refused before allocating."""
+
+
+# --------------------------------------------------------------------------
+# The Message object
+# --------------------------------------------------------------------------
+
+@dataclass
+class Message:
+    """One protocol message, as a normal Python object.
+
+    Only three things are yours to choose. Everything else in the header
+    (magic, version, length, crc) is derived at encode time, so it is
+    impossible to construct a Message with an inconsistent header.
+    """
+
+    msg_type: MsgType
+    seq: int = 0
+    payload: bytes = b""
+
+    def __post_init__(self) -> None:
+        """Runs automatically right after the object is built. Rejects bad
+        input at construction time rather than letting it reach the wire."""
+        if not isinstance(self.payload, (bytes, bytearray)):
+            raise TypeError(
+                f"payload must be bytes, got {type(self.payload).__name__}"
+            )
+        self.payload = bytes(self.payload)
+
+        if len(self.payload) > MAX_PAYLOAD_SIZE:
+            raise PayloadTooLargeError(
+                f"payload is {len(self.payload)} bytes, "
+                f"limit is {MAX_PAYLOAD_SIZE}"
+            )
+
+        # seq is a 4-byte field, so wrap instead of overflowing struct.
+        self.seq = self.seq % SEQ_MODULO
+        self.msg_type = MsgType(self.msg_type)
+
+    def encode(self) -> bytes:
+        """Turn this object into the bytes that go on the wire.
+
+        Order matters: build the 14-byte header prefix, checksum it together
+        with the payload, then glue prefix + crc + payload.
+        """
+        prefix = struct.pack(
+            HEADER_PREFIX_FORMAT,
+            MAGIC,
+            VERSION,
+            int(self.msg_type),
+            self.seq,
+            len(self.payload),
+        )
+
+        crc = zlib.crc32(prefix + self.payload)
+
+        return prefix + struct.pack("!I", crc) + self.payload
+
+    def __len__(self) -> int:
+        """len(msg) == number of bytes this message occupies on the wire."""
+        return HEADER_SIZE + len(self.payload)
+
+    def __repr__(self) -> str:
+        """Never dump a 1 MB payload into a log line or a traceback."""
+        preview = self.payload[:16]
+        tail = "..." if len(self.payload) > 16 else ""
+        return (
+            f"Message(type={self.msg_type.name}, seq={self.seq}, "
+            f"len={len(self.payload)}, payload={preview!r}{tail})"
+        )
+
+
+# --------------------------------------------------------------------------
+# Self-check. Only runs when you execute this file directly:
+#     python protocol.py
+# When another file does `import protocol`, this block is skipped.
+# --------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    print("HEADER_SIZE    :", HEADER_SIZE, "bytes")
+    print("CRC_OFFSET     :", CRC_OFFSET)
+    print("message types  :", [f"{m.name}={m.value}" for m in MsgType])
+    print()
+
+    msg = Message(MsgType.ECHO, seq=7, payload=b"hello world")
+    frame = msg.encode()
+
+    print("the object     :", msg)
+    print("wire size      :", len(msg), "=", HEADER_SIZE, "header +",
+          len(msg.payload), "payload")
+    print("encoded bytes  :", frame)
+    print("as hex         :", " ".join(f"{b:02x}" for b in frame))
+    print()
+
+    empty = Message(MsgType.GOODBYE)
+    print("empty payload  :", empty)
+    print("still valid    :", len(empty.encode()), "bytes (header only)")
+    print()
+
+    try:
+        Message(MsgType.DATA, payload="i am text, not bytes")
+    except TypeError as exc:
+        print("rejected       :", exc)
+
+    print()
+    print("self-check OK")

@@ -184,6 +184,80 @@ class Message:
 
 
 # --------------------------------------------------------------------------
+# Decoding — bytes back into a Message
+# --------------------------------------------------------------------------
+
+def decode_header(head: bytes) -> tuple[MsgType, int, int, int]:
+    """Validate and unpack the 18-byte header only.
+
+    Returns (msg_type, seq, payload_length, crc).
+
+    A server calls this FIRST, before reading the payload, because the
+    payload length it is about to trust comes from here. Every check below
+    happens before a single payload byte is allocated.
+    """
+    if len(head) < HEADER_SIZE:
+        raise TruncatedFrameError(
+            f"header is {len(head)} bytes, need {HEADER_SIZE}"
+        )
+
+    magic, version, raw_type, seq, length, crc = struct.unpack(
+        HEADER_FORMAT, head[:HEADER_SIZE]
+    )
+
+    # 1. Is this even our protocol? Cheapest check, so it goes first.
+    if magic != MAGIC:
+        raise BadMagicError(f"expected {MAGIC!r}, got {magic!r}")
+
+    # 2. Do we understand this version?
+    if version != VERSION:
+        raise UnsupportedVersionError(
+            f"peer speaks version {version}, we speak {VERSION}"
+        )
+
+    # 3. Is the declared size sane? THIS is the line that stops a peer from
+    #    making us allocate 4 GB. It must run before we read the payload.
+    if length > MAX_PAYLOAD_SIZE:
+        raise PayloadTooLargeError(
+            f"peer declared {length} bytes, limit is {MAX_PAYLOAD_SIZE}"
+        )
+
+    # 4. Is the type one we know? MsgType() raises ValueError on unknown
+    #    values, so translate it into our own exception family.
+    try:
+        msg_type = MsgType(raw_type)
+    except ValueError:
+        raise ProtocolError(f"unknown message type {raw_type}") from None
+
+    return msg_type, seq, length, crc
+
+
+def decode(frame: bytes) -> Message:
+    """Turn a complete frame (header + payload) back into a Message.
+
+    The CRC is checked last, on purpose: it is the most expensive check, and
+    there is no point hashing a payload we already know is malformed.
+    """
+    msg_type, seq, length, crc_claimed = decode_header(frame)
+
+    payload = frame[HEADER_SIZE:]
+
+    if len(payload) != length:
+        raise TruncatedFrameError(
+            f"header declared {length} payload bytes, frame carries "
+            f"{len(payload)}"
+        )
+
+    crc_actual = zlib.crc32(frame[:CRC_OFFSET] + payload)
+    if crc_actual != crc_claimed:
+        raise ChecksumError(
+            f"crc mismatch: header says {crc_claimed}, computed {crc_actual}"
+        )
+
+    return Message(msg_type, seq, payload)
+
+
+# --------------------------------------------------------------------------
 # Self-check. Only runs when you execute this file directly:
 #     python protocol.py
 # When another file does `import protocol`, this block is skipped.
@@ -205,15 +279,29 @@ if __name__ == "__main__":
     print("as hex         :", " ".join(f"{b:02x}" for b in frame))
     print()
 
-    empty = Message(MsgType.GOODBYE)
-    print("empty payload  :", empty)
-    print("still valid    :", len(empty.encode()), "bytes (header only)")
+    # --- round trip -----------------------------------------------------
+    back = decode(frame)
+    print("decoded back   :", back)
+    print("identical      :", back == msg)
     print()
 
-    try:
-        Message(MsgType.DATA, payload="i am text, not bytes")
-    except TypeError as exc:
-        print("rejected       :", exc)
+    # --- every way it can go wrong --------------------------------------
+    print("failure cases")
+
+    def show(label, bad_bytes):
+        try:
+            decode(bad_bytes)
+            print(f"  {label:<18} NO ERROR (bug!)")
+        except ProtocolError as exc:
+            print(f"  {label:<18} {type(exc).__name__}: {exc}")
+
+    show("bad magic", b"XXXX" + frame[4:])
+    show("wrong version", frame[:4] + b"\x09" + frame[5:])
+    show("truncated header", frame[:10])
+    show("truncated payload", frame[:-3])
+    show("flipped payload", frame[:-1] + b"X")
+    show("huge length", struct.pack(HEADER_FORMAT, MAGIC, VERSION,
+                                    MsgType.DATA, 1, 4_000_000_000, 0))
 
     print()
     print("self-check OK")

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Benchmark / capture output
+*.pcap
+bench_results.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

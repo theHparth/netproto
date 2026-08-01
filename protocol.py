@@ -258,6 +258,63 @@ def decode(frame: bytes) -> Message:
 
 
 # --------------------------------------------------------------------------
+# Socket helpers — reading a whole frame off a live TCP connection
+# --------------------------------------------------------------------------
+
+def recv_exact(sock, n: int) -> bytes:
+    """Read exactly n bytes from sock, or raise.
+
+    sock.recv(n) returns UP TO n bytes — it can and will return fewer. This
+    loops until the buffer is full, asking each time only for what is still
+    missing.
+    """
+    if n == 0:
+        # A zero-length payload is legal (e.g. GOODBYE). Never call recv(0):
+        # it returns b"" and we would mistake that for a closed connection.
+        return b""
+
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            # b"" means the peer performed a clean shutdown mid-frame.
+            raise TruncatedFrameError(
+                f"connection closed after {len(buf)} of {n} bytes"
+            )
+        buf.extend(chunk)
+
+    return bytes(buf)
+
+
+def read_message(sock) -> Message:
+    """Read one complete Message from a blocking TCP socket.
+
+    This is the two-read dance:
+      1. read a fixed HEADER_SIZE bytes  -> we now know the payload length
+      2. read exactly that many more     -> we now have the whole frame
+    """
+    head = recv_exact(sock, HEADER_SIZE)
+
+    # Validate the header BEFORE trusting its length field.
+    _msg_type, _seq, length, _crc = decode_header(head)
+
+    payload = recv_exact(sock, length)
+
+    return decode(head + payload)
+
+
+def send_message(sock, msg: Message) -> int:
+    """Write one Message to a blocking TCP socket. Returns bytes sent.
+
+    sendall() loops internally until every byte is written, so there is no
+    send-side equivalent of recv_exact to write here.
+    """
+    frame = msg.encode()
+    sock.sendall(frame)
+    return len(frame)
+
+
+# --------------------------------------------------------------------------
 # Self-check. Only runs when you execute this file directly:
 #     python protocol.py
 # When another file does `import protocol`, this block is skipped.
@@ -302,6 +359,34 @@ if __name__ == "__main__":
     show("flipped payload", frame[:-1] + b"X")
     show("huge length", struct.pack(HEADER_FORMAT, MAGIC, VERSION,
                                     MsgType.DATA, 1, 4_000_000_000, 0))
+
+    # --- over a real socket ---------------------------------------------
+    import socket
+
+    print()
+    print("over a real socket pair")
+
+    left, right = socket.socketpair()
+    try:
+        sent = send_message(left, Message(MsgType.DATA, 42, b"over a socket"))
+        got = read_message(right)
+        print("  sent           :", sent, "bytes")
+        print("  read back      :", got)
+
+        # zero-length payload must survive the round trip too
+        send_message(left, Message(MsgType.GOODBYE))
+        print("  empty payload  :", read_message(right))
+
+        # peer closes mid-frame -> TruncatedFrameError
+        left.sendall(Message(MsgType.DATA, 1, b"cut me off").encode()[:20])
+        left.close()
+        try:
+            read_message(right)
+        except ProtocolError as exc:
+            print("  half a frame   :", f"{type(exc).__name__}: {exc}")
+    finally:
+        left.close()
+        right.close()
 
     print()
     print("self-check OK")

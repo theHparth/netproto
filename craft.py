@@ -21,10 +21,16 @@ there. Live sniffing needs root on Linux/macOS and Npcap on Windows.
 """
 
 import argparse
+import logging
 import struct
 import zlib
 
-from scapy.all import (
+# "WARNING: No libpcap provider available !" is printed at import time on any
+# machine without Npcap/libpcap. It only matters for --mode sniff and
+# --mode send; building packets and reading pcap files work fine without it.
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+
+from scapy.all import (  # noqa: E402  (import must follow the logging setup)
     IP,
     UDP,
     ByteEnumField,
@@ -57,6 +63,15 @@ from protocol import (
 
 NPTK_PORT = 9500
 PCAP_FILE = "capture.pcap"
+
+# Literal MAC addresses for the Ethernet header.
+#
+# If you leave Ether() empty, Scapy tries to look up the MAC of your default
+# network interface -- which needs libpcap/Npcap and fails on a plain Windows
+# install with "Interface '...' not found". We are building packets for a
+# file, not for a real card, so any well-formed MAC will do.
+SRC_MAC = "02:00:00:00:00:01"
+DST_MAC = "02:00:00:00:00:02"
 
 
 # --------------------------------------------------------------------------
@@ -116,7 +131,7 @@ def craft(seq: int, payload: bytes,
           src: str = "127.0.0.1", dst: str = "127.0.0.1"):
     """Build a full Ethernet/IP/UDP/NPTK packet from scratch."""
     return (
-        Ether()
+        Ether(src=SRC_MAC, dst=DST_MAC)
         / IP(src=src, dst=dst)
         / UDP(sport=40000 + seq, dport=NPTK_PORT)
         / NPTK(seq=seq, msg_type=int(msg_type), body=payload)
